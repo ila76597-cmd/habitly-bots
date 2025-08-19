@@ -1,7 +1,0 @@
-aiogram==3.11.0
-yookassa
-openai
-apscheduler
-python-dotenv
-flask
-sqlite3
