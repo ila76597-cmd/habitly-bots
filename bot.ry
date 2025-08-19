@@ -1,0 +1,416 @@
+# bot.py
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram import Router
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from datetime import datetime, timedelta
+import asyncio
+import sqlite3
+import logging
+import time
+from threading import Thread
+
+# Настройка логирования
+logging.basicConfig(level=logging.WARNING)
+
+# Импорты библиотек
+from config import BOT_TOKEN
+from db import init_db, get_db
+import payment
+import ai_analyzer
+
+# === Создаём бота и диспетчер ===
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+router = Router()
+scheduler = AsyncIOScheduler()
+
+# === Клавиатура ===
+main_kb = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="➕ Добавить привычку")],
+        [KeyboardButton(text="✅ Отметить привычку")],
+        [KeyboardButton(text="📊 Мои привычки")],
+        [KeyboardButton(text="📬 Отчёт")],
+        [KeyboardButton(text="💳 Подписка")],
+        [KeyboardButton(text="🔗 Рефералка")]
+    ],
+    resize_keyboard=True
+)
+
+# === Команда /start ===
+@router.message(Command("start"))
+async def start(message: types.Message):
+    user_id = message.from_user.id
+    first_name = message.from_user.first_name
+
+    # Обработка реферала
+    if message.text.startswith("/start ref"):
+        ref_id = message.text.split(" ")[1].replace("ref", "")
+        try:
+            await bot.send_message(int(ref_id), "🎁 Твой друг пришёл по твоей ссылке! Спасибо!")
+        except Exception as e:
+            print(f"Не удалось уведомить рефовода {ref_id}: {e}")
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("INSERT OR IGNORE INTO users (id, first_name, start_date) VALUES (?, ?, ?)",
+                (user_id, first_name, datetime.now().date().isoformat()))
+    conn.commit()
+    conn.close()
+
+    await message.answer(
+        f"Привет, {first_name}! 👋\n"
+        "Я — Habitly, твой личный трекер привычек.\n\n"
+        "Помогу тебе:\n"
+        "• Заводить полезные привычки\n"
+        "• Не срываться\n"
+        "• Получать персональные отчёты от ИИ\n\n"
+        "Выбери, что делать:", reply_markup=main_kb
+    )
+
+# --- Добавление привычки ---
+@router.message(F.text == "➕ Добавить привычку")
+async def add_habit_prompt(message: types.Message):
+    await message.answer("Напиши, какую привычку хочешь завести:\nНапример: *Пить воду*, *Читать 10 мин*, *Не прокрастинировать*")
+
+@router.message(F.text.func(lambda text: text not in ["✅ Отметить привычку", "📊 Мои привычки", "📬 Отчёт", "💳 Подписка", "➕ Добавить привычку", "🔗 Рефералка"]))
+async def save_habit(message: types.Message):
+    user_id = message.from_user.id
+    habit_name = message.text.strip()
+
+    if len(habit_name) < 2 or len(habit_name) > 50:
+        await message.answer("Название слишком короткое или длинное.")
+        return
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("INSERT INTO habits (user_id, name, created_at) VALUES (?, ?, ?)",
+                (user_id, habit_name, datetime.now().date().isoformat()))
+    conn.commit()
+    conn.close()
+
+    await message.answer(f"✅ Привычка '{habit_name}' добавлена!")
+
+# --- Отметить выполнение ---
+@router.message(F.text == "✅ Отметить привычку")
+async def mark_habit(message: types.Message):
+    user_id = message.from_user.id
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT id, name FROM habits WHERE user_id = ?", (user_id,))
+    habits = cur.fetchall()
+    conn.close()
+
+    if not habits:
+        await message.answer("Сначала добавь привычку через '➕ Добавить привычку'")
+        return
+
+    kb = InlineKeyboardBuilder()
+    for h_id, name in habits:
+        kb.add(InlineKeyboardButton(text=name, callback_data=f"mark_{h_id}"))
+    kb.adjust(1)
+
+    await message.answer("Выбери привычку, которую выполнил сегодня:", reply_markup=kb.as_markup())
+
+@router.callback_query(F.data.startswith("mark_"))
+async def mark_done(callback: types.CallbackQuery):
+    habit_id = int(callback.data.split("_")[1])
+    today = datetime.now().date().isoformat()
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("INSERT OR IGNORE INTO completions (habit_id, date) VALUES (?, ?)", (habit_id, today))
+    conn.commit()
+    conn.close()
+
+    await callback.answer("Отлично! 🎉 Привычка отмечена.")
+    await callback.message.delete()
+
+# --- Статистика ---
+@router.message(F.text == "📊 Мои привычки")
+async def show_stats(message: types.Message):
+    user_id = message.from_user.id
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT h.name, COUNT(c.id) 
+        FROM habits h 
+        LEFT JOIN completions c ON h.id = c.habit_id AND c.date >= date('now', '-7 days')
+        WHERE h.user_id = ?
+        GROUP BY h.id
+    """, (user_id,))
+    stats = cur.fetchall()
+    conn.close()
+
+    if not stats:
+        await message.answer("Пока нет привычек или выполнений.")
+        return
+
+    text = "📈 Твоя статистика за неделю:\n\n"
+    for name, count in stats:
+        text += f"🔹 {name}: {count}/7 дней\n"
+
+    await message.answer(text)
+
+# --- Отчёт ---
+@router.message(F.text == "📬 Отчёт")
+async def request_report(message: types.Message):
+    user_id = message.from_user.id
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT premium_until FROM users WHERE id = ?", (user_id,))
+    row = cur.fetchone()
+
+    if not row or not row[0]:
+        conn.close()
+        await message.answer("Отчёт доступен только по подписке. Нажми '💳 Подписка'")
+        return
+
+    try:
+        premium_until = datetime.strptime(row[0], "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        conn.close()
+        await message.answer("Ошибка чтения подписки. Попробуй позже.")
+        return
+
+    if premium_until < datetime.now().date():
+        conn.close()
+        await message.answer("Подписка истекла. Продли, чтобы получать отчёты.")
+        return
+
+    cur.execute("""
+        SELECT h.name, COUNT(c.id) 
+        FROM habits h 
+        LEFT JOIN completions c ON h.id = c.habit_id AND c.date >= date('now', '-7 days')
+        WHERE h.user_id = ?
+        GROUP BY h.id
+    """, (user_id,))
+    stats = cur.fetchall()
+    conn.close()
+
+    if not stats:
+        await message.answer("Сначала добавь привычки и отмечай их.")
+        return
+
+    stats_text = ", ".join([f"{name}: {count} раз" for name, count in stats])
+    report = ai_analyzer.get_ai_insight(stats_text)
+    await message.answer(f"📬 Твой персональный отчёт:\n\n{report}")
+
+# --- Подписка ---
+@router.message(F.text == "💳 Подписка")
+async def send_subscription_info(message: types.Message):
+    user_id = message.from_user.id
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT premium_until, trial_used FROM users WHERE id = ?", (user_id,))
+    row = cur.fetchone()
+    conn.close()
+
+    if not row:
+        trial_used = 0
+        premium_until = None
+    else:
+        premium_until_str, trial_used = row
+        try:
+            premium_until = datetime.strptime(premium_until_str, "%Y-%m-%d").date() if premium_until_str else None
+        except (ValueError, TypeError):
+            premium_until = None
+
+    now = datetime.now().date()
+    if premium_until and premium_until > now:
+        await message.answer(f"✅ У тебя уже активна подписка до {premium_until}")
+        return
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎁 3 дня бесплатно", callback_data="trial")],
+        [InlineKeyboardButton(text="💳 199 руб/мес", callback_data="pay")]
+    ])
+
+    await message.answer("Получи доступ к:\n"
+                         "• Еженедельным ИИ-отчётам\n"
+                         "• Персональным советам\n"
+                         "• Расширенной аналитике\n\n"
+                         "Выбери:", reply_markup=kb)
+
+@router.callback_query(F.data == "trial")
+async def start_trial(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT trial_used FROM users WHERE id = ?", (user_id,))
+    row = cur.fetchone()
+    trial_used = row[0] if row else 0
+
+    if trial_used:
+        await callback.answer("Бесплатный период уже использован.")
+    else:
+        new_date = (datetime.now().date() + timedelta(days=3)).isoformat()
+        cur.execute("UPDATE users SET premium_until = ?, trial_used = 1 WHERE id = ?", (new_date, user_id))
+        conn.commit()
+        await callback.message.edit_text("🎉 У тебя 3 дня бесплатного доступа! Используй отчёты от ИИ.")
+    conn.close()
+
+@router.callback_query(F.data == "pay")
+async def pay(callback: types.CallbackQuery):
+    await payment.create_invoice(callback.message)
+
+# --- Реферальная ссылка ---
+@router.message(F.text == "🔗 Рефералка")
+async def ref_link(message: types.Message):
+    user_id = message.from_user.id
+    ref_link = f"https://t.me/HabitlyTrackerBot?start=ref{user_id}"
+    text = (
+        f"🌟 Поделись своей ссылкой и получай бонусы!\n\n"
+        f"Когда твой друг перейдёт по ссылке и оформит подписку — ты получишь 30% скидки!\n\n"
+        f"Твоя ссылка:\n"
+        f"<code>{ref_link}</code>\n\n"
+        f"Или просто перешли это сообщение:"
+    )
+    await message.answer(text, parse_mode="HTML")
+    await message.answer(ref_link)
+
+# --- Статистика (только для тебя) ---
+@router.message(Command("stats"))
+async def stats(message: types.Message):
+    # 🔐 Твой ID
+    MY_ID = 1477841285
+
+    if message.from_user.id != MY_ID:
+        return
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM users")
+    total = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM users WHERE premium_until > date('now')")
+    paid = cur.fetchone()[0]
+    conn.close()
+
+    await message.answer(f"📊 Статистика бота:\n\n"
+                        f"👤 Всего пользователей: {total}\n"
+                        f"✅ Активных подписчиков: {paid}")
+
+# --- Ежедневное напоминание ---
+async def send_daily_reminder():
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT DISTINCT h.user_id FROM habits h
+        WHERE h.user_id NOT IN (
+            SELECT h2.user_id FROM habits h2
+            JOIN completions c ON h2.id = c.habit_id
+            WHERE c.date = date('now')
+        )
+    """)
+    users = cur.fetchall()
+    conn.close()
+
+    for (user_id,) in users:
+        try:
+            await bot.send_message(user_id, "🔔 Привет! Ты не отмечал привычки сегодня. Не сдавайся — просто отметь одну!")
+        except Exception as e:
+            print(f"Не удалось отправить напоминание {user_id}: {e}")
+
+scheduler.add_job(send_daily_reminder, 'cron', hour=20, minute=0)
+
+# --- Еженедельный отчёт ---
+async def send_weekly_digest():
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT u.id, u.first_name,
+               GROUP_CONCAT(h.name || ': ' || COUNT(c.id)) as stats
+        FROM users u
+        JOIN habits h ON u.id = h.user_id
+        LEFT JOIN completions c ON h.id = c.habit_id AND c.date >= date('now', '-7 days')
+        WHERE u.premium_until > date('now')
+        GROUP BY u.id
+    """)
+    users = cur.fetchall()
+    conn.close()
+
+    for user_id, name, stats_data in users:
+        if stats_data:
+            report = ai_analyzer.get_ai_insight(stats_data)
+            try:
+                await bot.send_message(user_id, f"📬 Твой еженедельный отчёт, {name}:\n\n{report}")
+            except Exception as e:
+                print(f"Не удалось отправить отчёт пользователю {user_id}: {e}")
+
+scheduler.add_job(send_weekly_digest, 'cron', day_of_week='sun', hour=10, minute=0)
+
+# --- Ежедневный отчёт статистики создателю ---
+async def send_daily_stats():
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM users")
+    total = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM users WHERE premium_until > date('now')")
+    paid = cur.fetchone()[0]
+    conn.close()
+
+    # 🔐 Твой ID
+    my_id = 1477841285
+
+    try:
+        await bot.send_message(
+            my_id,
+            f"📈 **Ежедневная статистика**\n\n"
+            f"👤 Всего пользователей: {total}\n"
+            f"✅ Активных подписчиков: {paid}\n\n"
+            f"Бот работает стабильно. Продвигай дальше! 💪",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        print(f"❌ Не удалось отправить статистику: {e}")
+
+# Запуск каждый день в 9:00
+scheduler.add_job(send_daily_stats, 'cron', hour=9, minute=0)
+
+# === ВЕБ-СЕРВЕР ДЛЯ БОДРСТВОВАНИЯ ===
+from flask import Flask
+
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "✅ HabitlyBot работает. Бот активен."
+
+def run():
+    app.run(host='0.0.0.0', port=8080)
+
+def keep_alive():
+    # Запускаем веб-сервер в отдельном потоке
+    server = Thread(target=run)
+    server.daemon = True
+    server.start()
+
+    # Запускаем таймер в отдельном потоке
+    timer = Thread(target=lambda: _timer_loop())
+    timer.daemon = True
+    timer.start()
+
+def _timer_loop():
+    while True:
+        print(f"⏰ Бот работает... {time.strftime('%H:%M:%S')}")
+        time.sleep(300)  # Каждые 5 минут
+# === КОНЕЦ ВЕБ-СЕРВЕРА ===
+
+# === Запуск ===
+dp.include_router(router)
+payment.set_bot(bot)
+
+async def main():
+    init_db()
+    scheduler.start()
+    keep_alive()  # ← Запускаем веб-сервер и таймер
+    print("✅ Habitly запущен. Бот готов к работе.")
+    await dp.start_polling(bot)
+
+# Запуск бота
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(main())
